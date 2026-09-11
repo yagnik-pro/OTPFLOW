@@ -1,0 +1,58 @@
+name: Build OTP Flow APK
+
+on:
+  workflow_dispatch:      # "Run workflow" button
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+
+      # the repo only has lib/, assets/ and pubspec.yaml —
+      # this generates the android/ios shell around it
+      - name: Create Flutter platform folders
+        run: |
+          flutter create --platforms=android --org com.otpflow --project-name otpflow .
+
+      - name: Restore custom AndroidManifest
+        run: |
+          if [ -f android_overrides/AndroidManifest.xml ]; then
+            cp android_overrides/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          fi
+
+      - name: Set app label + minSdk
+        run: |
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' android/app/build.gradle.kts 2>/dev/null || true
+          sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/' android/app/build.gradle 2>/dev/null || true
+
+      - name: Generate launcher icon from logo
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y imagemagick
+          for d in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+            name=${d%%:*}; size=${d##*:}
+            mkdir -p android/app/src/main/res/mipmap-$name
+            convert assets/images/logo.png -resize ${size}x${size} android/app/src/main/res/mipmap-$name/ic_launcher.png
+          done
+
+      - run: flutter pub get
+      - run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OTPFlow-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
