@@ -112,7 +112,7 @@ class MeeshoApi {
   }
 
   // ------------------------------------------------------------------ LOGIN
-  /// Last login attempt details — surfaced in Settings → Diagnostics.
+  /// Last login attempt details — surfaced in Settings → Login diagnostics.
   static String? lastLoginDebug;
 
   /// Loads the login page the way a browser does — this is where Meesho hands
@@ -156,9 +156,6 @@ class MeeshoApi {
     }
     return Options(headers: h);
   }
-
-  /// Last login attempt details — surfaced in Settings → Login diagnostics.
-  static String? lastLoginDebug;
 
   /// Logs in with email + password. Returns { token, supplierId, storeName }.
   ///
