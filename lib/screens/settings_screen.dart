@@ -108,6 +108,15 @@ class SettingsScreen extends StatelessWidget {
                     child: Column(
                       children: [
                         ListTile(
+                          leading: const Icon(Icons.login_rounded, color: AppColors.blueDeep),
+                          title: const Text('Login diagnostics', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14.5)),
+                          subtitle: const Text('What Meesho replied to the last login attempt', style: TextStyle(fontSize: 12.3, color: AppColors.ink2)),
+                          trailing: const Icon(Icons.chevron_right_rounded, color: AppColors.ink2),
+                          onTap: () => _showText(context, 'Login diagnostics', MeeshoApi.lastLoginDebug,
+                              'No login attempt yet in this session.\n\nTap Relogin on an account, then come back here.'),
+                        ),
+                        const Divider(height: 1, color: AppColors.skyLine),
+                        ListTile(
                           leading: const Icon(Icons.bug_report_outlined, color: AppColors.blueDeep),
                           title: const Text('Last raw API response', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14.5)),
                           subtitle: const Text('Only useful if OTPs stop showing up', style: TextStyle(fontSize: 12.3, color: AppColors.ink2)),
@@ -169,8 +178,15 @@ class SettingsScreen extends StatelessWidget {
             style: const TextStyle(fontSize: 11.5, letterSpacing: 1.2, fontWeight: FontWeight.w800, color: AppColors.ink2)),
       );
 
-  void _showRaw(BuildContext context) {
-    final raw = MeeshoApi.lastRawResponse;
+  void _showRaw(BuildContext context) => _showText(
+        context,
+        'Raw OTP response',
+        MeeshoApi.lastRawResponse,
+        'Nothing captured yet.\n\nThis only fills in when a refresh returns no OTPs — '
+            'so an empty box here usually means everything is working.',
+      );
+
+  void _showText(BuildContext context, String title, String? content, String emptyMsg) {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -189,11 +205,21 @@ class SettingsScreen extends StatelessWidget {
               padding: const EdgeInsets.symmetric(horizontal: 18),
               child: Row(
                 children: [
-                  const Expanded(child: Text('Raw OTP response', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800))),
-                  if (raw != null)
-                    IconButton(
-                      icon: const Icon(Icons.copy_rounded, size: 20, color: AppColors.blueDeep),
-                      onPressed: () => Clipboard.setData(ClipboardData(text: raw)),
+                  Expanded(child: Text(title, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800))),
+                  if (content != null)
+                    FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: AppColors.blue,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(999)),
+                      ),
+                      onPressed: () {
+                        Clipboard.setData(ClipboardData(text: content));
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('Copied — paste it in the chat'), margin: EdgeInsets.all(14)),
+                        );
+                      },
+                      icon: const Icon(Icons.copy_rounded, size: 16),
+                      label: const Text('Copy', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
                     ),
                 ],
               ),
@@ -203,9 +229,8 @@ class SettingsScreen extends StatelessWidget {
               child: SingleChildScrollView(
                 controller: ctl,
                 padding: const EdgeInsets.fromLTRB(18, 0, 18, 28),
-                child: Text(
-                  raw ?? 'Nothing captured yet.\n\nThis only fills in when a refresh returns no OTPs — '
-                      'so an empty box here usually means everything is working.',
+                child: SelectableText(
+                  content ?? emptyMsg,
                   style: const TextStyle(fontSize: 12, fontFamily: 'monospace', height: 1.5, color: AppColors.ink),
                 ),
               ),
