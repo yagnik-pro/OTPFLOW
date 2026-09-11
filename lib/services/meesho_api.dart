@@ -33,9 +33,39 @@ class MeeshoError implements Exception {
 ///   POST /api/payouts/payments/all-ui-data2       → payments summary
 class MeeshoApi {
   static const base = 'https://supplier.meesho.com';
-  static const _ua =
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-      '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+  /// Different ways to present ourselves. Meesho's edge rejected the
+  /// "desktop Chrome" disguise outright (403 on a plain page load), so we try
+  /// several and keep whichever one the server actually accepts.
+  static const _profiles = <String, Map<String, String>>{
+    'android-chrome': {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36',
+      'Accept-Language': 'en-IN,en-GB;q=0.9,en;q=0.8',
+      'sec-ch-ua-mobile': '?1',
+      'sec-ch-ua-platform': '"Android"',
+    },
+    'plain': {
+      'Accept-Language': 'en-IN,en;q=0.9',
+    },
+    'desktop-chrome': {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
+      'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+    },
+  };
+
+  /// Profile that last worked — reused for every later request.
+  static String activeProfile = 'android-chrome';
+
+  void _useProfile(String name) {
+    activeProfile = name;
+    _dio.options.headers
+      ..clear()
+      ..addAll(_profiles[name]!);
+  }
 
   final String accountId;
   late final Dio _dio;
@@ -55,24 +85,12 @@ class MeeshoApi {
       baseUrl: base,
       connectTimeout: const Duration(seconds: 20),
       receiveTimeout: const Duration(seconds: 25),
-      headers: {
-        'User-Agent': _ua,
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
-        'Content-Type': 'application/json',
-        'Origin': base,
-        'Referer': '$base/panel/v3/new/root/login',
-        'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'same-origin',
-      },
-      // we check status ourselves
+      // NOTE: no global Origin / Content-Type — a navigation GET must not carry
+      // them, and sending them everywhere is what the WAF flags.
       validateStatus: (s) => s != null && s < 500,
     ));
     _dio.interceptors.add(CookieManager(_jar));
+    _useProfile(activeProfile);
     _ready = true;
   }
 
@@ -97,113 +115,122 @@ class MeeshoApi {
   /// Last login attempt details — surfaced in Settings → Diagnostics.
   static String? lastLoginDebug;
 
-  /// A real browser loads the login page first, which is where Meesho sets its
-  /// session / bot-protection / CSRF cookies. Hitting the API cold returns 403,
-  /// so we warm the session up exactly the way the panel does.
-  Future<String> _warmUp() async {
-    final log = StringBuffer();
-    try {
-      final res = await _dio.get(
-        '/panel/v3/new/root/login',
-        options: Options(
-          headers: {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Upgrade-Insecure-Requests': '1',
-          },
-          responseType: ResponseType.plain,
-          followRedirects: true,
-        ),
-      );
-      final cookies = await _jar.loadForRequest(Uri.parse(base));
-      log.writeln('warm-up GET /panel/v3/new/root/login → HTTP ${res.statusCode}, '
-          '${cookies.length} cookie(s): ${cookies.map((c) => c.name).join(", ")}');
-
-      // Echo the CSRF/XSRF token back as a header if Meesho set one.
-      for (final c in cookies) {
-        final n = c.name.toLowerCase();
-        if (n.contains('xsrf') || n.contains('csrf')) {
-          _dio.options.headers['X-XSRF-TOKEN'] = c.value;
-          _dio.options.headers['X-CSRF-Token'] = c.value;
-          log.writeln('csrf header set from cookie "${c.name}"');
-        }
-      }
-    } catch (e) {
-      log.writeln('warm-up failed: $e');
-    }
-    return log.toString();
+  /// Loads the login page the way a browser does — this is where Meesho hands
+  /// out its session / bot-protection cookies. Returns the cookies it collected.
+  Future<List<Cookie>> _warmUp() async {
+    await _dio.get(
+      '/panel/v3/new/root/login',
+      options: Options(
+        headers: {
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'none',
+          'Sec-Fetch-User': '?1',
+          'Upgrade-Insecure-Requests': '1',
+        },
+        responseType: ResponseType.plain,
+        followRedirects: true,
+      ),
+    );
+    return _jar.loadForRequest(Uri.parse(base));
   }
+
+  /// Headers a browser sends on the login XHR itself.
+  Options _xhr(List<Cookie> cookies) {
+    final h = <String, String>{
+      'Accept': 'application/json, text/plain, */*',
+      'Content-Type': 'application/json',
+      'Origin': base,
+      'Referer': '$base/panel/v3/new/root/login',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
+    };
+    for (final c in cookies) {
+      final n = c.name.toLowerCase();
+      if (n.contains('xsrf') || n.contains('csrf')) {
+        h['X-XSRF-TOKEN'] = c.value;
+        h['X-CSRF-Token'] = c.value;
+      }
+    }
+    return Options(headers: h);
+  }
+
+  /// Last login attempt details — surfaced in Settings → Login diagnostics.
+  static String? lastLoginDebug;
 
   /// Logs in with email + password. Returns { token, supplierId, storeName }.
   ///
-  /// Meesho has shipped a few different contracts for this endpoint, so we try
-  /// the known payload shapes in order and keep the full response for debugging.
+  /// Meesho's edge blocks clients it doesn't like (403 even on a plain page
+  /// load), so we try a few client profiles and payload shapes, and keep a full
+  /// transcript of what the server said.
   Future<Map<String, dynamic>> login(String email, String password) async {
     await _init();
     await _jar.deleteAll();
-    _dio.options.headers.remove('Authorization');
-    _dio.options.headers.remove('authorization');
-    _dio.options.headers.remove('X-XSRF-TOKEN');
-    _dio.options.headers.remove('X-CSRF-Token');
 
-    final warm = await _warmUp();
     final mail = email.trim();
-    final variants = <String, Map<String, dynamic>>{
+    final payloads = <String, Map<String, dynamic>>{
       'email+password': {'email': mail, 'password': password},
       '+login_type': {'email': mail, 'password': password, 'login_type': 'email'},
-      '+platform': {'email': mail, 'password': password, 'platform': 'web', 'source': 'supplier_panel'},
       'username': {'username': mail, 'password': password},
     };
 
-    final log = StringBuffer(warm)..writeln('POST /api/container/user/v2-login');
+    final log = StringBuffer();
     Response? success;
-    String? usedVariant;
 
-    for (final v in variants.entries) {
-      Response res;
+    for (final profile in _profiles.keys) {
+      _useProfile(profile);
+      await _jar.deleteAll();
+      log.writeln('--- profile: $profile ---');
+
+      List<Cookie> cookies = const [];
       try {
-        res = await _dio.post('/api/container/user/v2-login', data: v.value);
+        cookies = await _warmUp();
+        log.writeln('warm-up → ${cookies.length} cookie(s)'
+            '${cookies.isEmpty ? "" : ": ${cookies.map((c) => c.name).join(", ")}"}');
       } on DioException catch (e) {
-        log.writeln('${v.key}: network error — ${e.message ?? e.type.name}');
-        continue;
+        log.writeln('warm-up → ${e.response?.statusCode ?? e.type.name}');
+      } catch (e) {
+        log.writeln('warm-up → $e');
       }
-      final bodyTxt = _preview(res.data);
-      log.writeln('${v.key} → HTTP ${res.statusCode}');
-      log.writeln('   $bodyTxt');
-      log.writeln('   set-cookie: ${res.headers.map['set-cookie']?.length ?? 0} cookie(s)');
 
-      final body = _asMap(res.data);
-      final token = _firstString(body, const ['token', 'access_token', 'accessToken', 'id_token', 'idToken', 'jwt']);
-      final cookies = await _jar.loadForRequest(Uri.parse(base));
-      if (res.statusCode == 200 && (token != null || cookies.isNotEmpty)) {
-        success = res;
-        usedVariant = v.key;
-        break;
+      for (final pl in payloads.entries) {
+        Response res;
+        try {
+          res = await _dio.post('/api/container/user/v2-login', data: pl.value, options: _xhr(cookies));
+        } on DioException catch (e) {
+          log.writeln('  ${pl.key} → ${e.response?.statusCode ?? e.type.name}');
+          continue;
+        }
+        log.writeln('  ${pl.key} → HTTP ${res.statusCode}  ${_preview(res.data, 300)}');
+
+        final body = _asMap(res.data);
+        final token = _firstString(body, const ['token', 'access_token', 'accessToken', 'id_token', 'idToken', 'jwt']);
+        final now = await _jar.loadForRequest(Uri.parse(base));
+        if (res.statusCode == 200 && (token != null || now.isNotEmpty)) {
+          success = res;
+          log.writeln('  >>> SUCCESS with profile "$profile" / payload "${pl.key}"');
+          break;
+        }
       }
+      if (success != null) break;
     }
 
     lastLoginDebug = log.toString();
 
     if (success == null) {
-      // Surface what Meesho actually said instead of guessing.
-      final lines = log.toString().split('\n');
-      final postLine = lines.firstWhere(
-        (l) => l.contains('HTTP') && !l.contains('warm-up'),
-        orElse: () => lines.firstWhere((l) => l.contains('HTTP'), orElse: () => 'no response'),
-      );
-      final cookieLine = lines.firstWhere((l) => l.contains('cookie(s):'), orElse: () => '');
-      final detail = cookieLine.isEmpty ? postLine : '$postLine | $cookieLine';
-      throw MeeshoError('Login failed — $detail. Open Settings, then Login diagnostics, and send me that text.');
+      final firstPost = log.toString().split('\n').firstWhere(
+            (l) => l.trimLeft().startsWith('email+password') || l.contains('→ HTTP'),
+            orElse: () => 'all attempts blocked',
+          );
+      throw MeeshoError('Meesho blocked the request — $firstPost. '
+          'Open Settings, then Login diagnostics, and send me that text.');
     }
 
     final body = _asMap(success.data);
     final token = _firstString(body, const ['token', 'access_token', 'accessToken', 'id_token', 'idToken', 'jwt']);
     _applyToken(token);
-    log.writeln('OK via "$usedVariant"');
-    lastLoginDebug = log.toString();
 
     String supplierId = _firstString(body, const ['supplier_id', 'supplierId']) ?? '';
     String storeName = _firstString(body, const ['name', 'supplier_name', 'business_name', 'shop_name']) ?? '';
@@ -220,7 +247,7 @@ class MeeshoApi {
   // ------------------------------------------------------- SUPPLIER DETAILS
   Future<Map<String, String>> supplierDetails() async {
     await _init();
-    final res = await _dio.get('/api/container/supplier/getSupplierDetails');
+    final res = await _dio.get('/api/container/supplier/getSupplierDetails', options: _xhr(await _jar.loadForRequest(Uri.parse(base))));
     if (res.statusCode == 401 || res.statusCode == 403) throw SessionExpired();
     final body = _asMap(res.data);
     return {
@@ -239,11 +266,11 @@ class MeeshoApi {
 
     const path = '/api/fulfillment/returnRto/fetchDeliveryOTPs';
     final attempts = <Future<Response> Function()>[
-      () => _dio.post(path, data: {
-            if (supplierId != null && supplierId.isNotEmpty) 'supplier_id': int.tryParse(supplierId) ?? supplierId,
-          }),
-      () => _dio.post(path, data: {}),
-      () => _dio.get(path),
+      () async => _dio.post(path,
+          data: {if (supplierId != null && supplierId.isNotEmpty) 'supplier_id': int.tryParse(supplierId) ?? supplierId},
+          options: _xhr(await _jar.loadForRequest(Uri.parse(base)))),
+      () async => _dio.post(path, data: {}, options: _xhr(await _jar.loadForRequest(Uri.parse(base)))),
+      () async => _dio.get(path, options: _xhr(await _jar.loadForRequest(Uri.parse(base)))),
     ];
 
     Response? ok;
@@ -277,7 +304,7 @@ class MeeshoApi {
   Future<Map<String, dynamic>> fetchPayments() async {
     await _init();
     try {
-      final res = await _dio.post('/api/payouts/payments/all-ui-data2', data: {});
+      final res = await _dio.post('/api/payouts/payments/all-ui-data2', data: {}, options: _xhr(await _jar.loadForRequest(Uri.parse(base))));
       if (res.statusCode == 401 || res.statusCode == 403) throw SessionExpired();
       if (res.statusCode != 200) return {};
       final body = _asMap(res.data);
@@ -438,10 +465,11 @@ class MeeshoApi {
     return m.length > 160 ? m.substring(0, 160) : m;
   }
 
-  static String _preview(dynamic d) {
+  static String _preview(dynamic d, [int cap = 3000]) {
     try {
       final s = d is String ? d : jsonEncode(d);
-      return s.length > 3000 ? '${s.substring(0, 3000)}…' : s;
+      final one = s.replaceAll(RegExp(r'\s+'), ' ').trim();
+      return one.length > cap ? '${one.substring(0, cap)}…' : one;
     } catch (_) { return d.toString(); }
   }
 }
