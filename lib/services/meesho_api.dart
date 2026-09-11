@@ -58,9 +58,16 @@ class MeeshoApi {
       headers: {
         'User-Agent': _ua,
         'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
         'Content-Type': 'application/json',
         'Origin': base,
         'Referer': '$base/panel/v3/new/root/login',
+        'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
       },
       // we check status ourselves
       validateStatus: (s) => s != null && s < 500,
@@ -87,47 +94,73 @@ class MeeshoApi {
   }
 
   // ------------------------------------------------------------------ LOGIN
+  /// Last login attempt details — surfaced in Settings → Diagnostics.
+  static String? lastLoginDebug;
+
   /// Logs in with email + password. Returns { token, supplierId, storeName }.
+  ///
+  /// Meesho has shipped a few different contracts for this endpoint, so we try
+  /// the known payload shapes in order and keep the full response for debugging.
   Future<Map<String, dynamic>> login(String email, String password) async {
     await _init();
     await _jar.deleteAll();
     _dio.options.headers.remove('Authorization');
     _dio.options.headers.remove('authorization');
 
-    Response res;
-    try {
-      res = await _dio.post(
-        '/api/container/user/v2-login',
-        data: {'email': email.trim(), 'password': password},
-      );
-    } on DioException catch (e) {
-      throw MeeshoError('Network error: ${e.message ?? e.type.name}');
+    final mail = email.trim();
+    final variants = <String, Map<String, dynamic>>{
+      'email+password': {'email': mail, 'password': password},
+      '+login_type': {'email': mail, 'password': password, 'login_type': 'email'},
+      '+platform': {'email': mail, 'password': password, 'platform': 'web', 'source': 'supplier_panel'},
+      'username': {'username': mail, 'password': password},
+    };
+
+    final log = StringBuffer('POST /api/container/user/v2-login\n');
+    Response? success;
+    String? usedVariant;
+
+    for (final v in variants.entries) {
+      Response res;
+      try {
+        res = await _dio.post('/api/container/user/v2-login', data: v.value);
+      } on DioException catch (e) {
+        log.writeln('${v.key}: network error — ${e.message ?? e.type.name}');
+        continue;
+      }
+      final bodyTxt = _preview(res.data);
+      log.writeln('${v.key} → HTTP ${res.statusCode}');
+      log.writeln('   $bodyTxt');
+      log.writeln('   set-cookie: ${res.headers.map['set-cookie']?.length ?? 0} cookie(s)');
+
+      final body = _asMap(res.data);
+      final token = _firstString(body, const ['token', 'access_token', 'accessToken', 'id_token', 'idToken', 'jwt']);
+      final cookies = await _jar.loadForRequest(Uri.parse(base));
+      if (res.statusCode == 200 && (token != null || cookies.isNotEmpty)) {
+        success = res;
+        usedVariant = v.key;
+        break;
+      }
     }
 
-    final body = _asMap(res.data);
-    if (res.statusCode == 401 || res.statusCode == 403) {
-      throw MeeshoError(_msgFrom(body) ?? 'Wrong email or password');
-    }
-    if (res.statusCode != 200) {
-      throw MeeshoError(_msgFrom(body) ?? 'Login failed (${res.statusCode})');
+    lastLoginDebug = log.toString();
+
+    if (success == null) {
+      // Surface what Meesho actually said instead of guessing.
+      final firstLine = log.toString().split('\n').firstWhere(
+            (l) => l.contains('HTTP'),
+            orElse: () => 'no response',
+          );
+      throw MeeshoError('Login failed — $firstLine. Open Settings → Diagnostics and send me that text.');
     }
 
-    // token can sit at several levels depending on the response shape
-    final token = _firstString(body, const [
-      'token', 'access_token', 'accessToken', 'id_token', 'idToken', 'jwt',
-    ]);
-    final cookies = await _jar.loadForRequest(Uri.parse(base));
-    if (token == null && cookies.isEmpty) {
-      final msg = _msgFrom(body);
-      if (msg != null) throw MeeshoError(msg);
-      throw MeeshoError('Login did not return a session. Meesho may be asking for OTP/captcha.');
-    }
+    final body = _asMap(success.data);
+    final token = _firstString(body, const ['token', 'access_token', 'accessToken', 'id_token', 'idToken', 'jwt']);
     _applyToken(token);
+    log.writeln('OK via "$usedVariant"');
+    lastLoginDebug = log.toString();
 
     String supplierId = _firstString(body, const ['supplier_id', 'supplierId']) ?? '';
     String storeName = _firstString(body, const ['name', 'supplier_name', 'business_name', 'shop_name']) ?? '';
-
-    // fill in whatever the login response didn't give us
     if (supplierId.isEmpty || storeName.isEmpty) {
       try {
         final d = await supplierDetails();
@@ -135,7 +168,6 @@ class MeeshoApi {
         if (storeName.isEmpty) storeName = d['storeName'] ?? '';
       } catch (_) {}
     }
-
     return {'token': token ?? '', 'supplierId': supplierId, 'storeName': storeName};
   }
 
