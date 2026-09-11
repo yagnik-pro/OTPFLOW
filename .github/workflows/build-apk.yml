@@ -69,6 +69,18 @@ jobs:
 
       - run: flutter pub get
 
+      - name: Analyze Dart code (fails fast on real errors)
+        run: |
+          flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 | tee analyze.txt || true
+          if grep -qE "^ *error •" analyze.txt; then
+            echo "=============================================="
+            echo " DART ERRORS FOUND - copy the lines below to me"
+            echo "=============================================="
+            grep -E "^ *error •" analyze.txt
+            exit 1
+          fi
+          echo "no Dart errors"
+
       - name: Add namespace to plugins missing it
         run: |
           python3 - <<'PY'
