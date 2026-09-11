@@ -97,6 +97,46 @@ class MeeshoApi {
   /// Last login attempt details — surfaced in Settings → Diagnostics.
   static String? lastLoginDebug;
 
+  /// A real browser loads the login page first, which is where Meesho sets its
+  /// session / bot-protection / CSRF cookies. Hitting the API cold returns 403,
+  /// so we warm the session up exactly the way the panel does.
+  Future<String> _warmUp() async {
+    final log = StringBuffer();
+    try {
+      final res = await _dio.get(
+        '/panel/v3/new/root/login',
+        options: Options(
+          headers: {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
+          },
+          responseType: ResponseType.plain,
+          followRedirects: true,
+        ),
+      );
+      final cookies = await _jar.loadForRequest(Uri.parse(base));
+      log.writeln('warm-up GET /panel/v3/new/root/login → HTTP ${res.statusCode}, '
+          '${cookies.length} cookie(s): ${cookies.map((c) => c.name).join(", ")}');
+
+      // Echo the CSRF/XSRF token back as a header if Meesho set one.
+      for (final c in cookies) {
+        final n = c.name.toLowerCase();
+        if (n.contains('xsrf') || n.contains('csrf')) {
+          _dio.options.headers['X-XSRF-TOKEN'] = c.value;
+          _dio.options.headers['X-CSRF-Token'] = c.value;
+          log.writeln('csrf header set from cookie "${c.name}"');
+        }
+      }
+    } catch (e) {
+      log.writeln('warm-up failed: $e');
+    }
+    return log.toString();
+  }
+
   /// Logs in with email + password. Returns { token, supplierId, storeName }.
   ///
   /// Meesho has shipped a few different contracts for this endpoint, so we try
@@ -106,7 +146,10 @@ class MeeshoApi {
     await _jar.deleteAll();
     _dio.options.headers.remove('Authorization');
     _dio.options.headers.remove('authorization');
+    _dio.options.headers.remove('X-XSRF-TOKEN');
+    _dio.options.headers.remove('X-CSRF-Token');
 
+    final warm = await _warmUp();
     final mail = email.trim();
     final variants = <String, Map<String, dynamic>>{
       'email+password': {'email': mail, 'password': password},
@@ -115,7 +158,7 @@ class MeeshoApi {
       'username': {'username': mail, 'password': password},
     };
 
-    final log = StringBuffer('POST /api/container/user/v2-login\n');
+    final log = StringBuffer(warm)..writeln('POST /api/container/user/v2-login');
     Response? success;
     String? usedVariant;
 
@@ -146,11 +189,14 @@ class MeeshoApi {
 
     if (success == null) {
       // Surface what Meesho actually said instead of guessing.
-      final firstLine = log.toString().split('\n').firstWhere(
-            (l) => l.contains('HTTP'),
-            orElse: () => 'no response',
-          );
-      throw MeeshoError('Login failed — $firstLine. Open Settings → Diagnostics and send me that text.');
+      final lines = log.toString().split('\n');
+      final postLine = lines.firstWhere(
+        (l) => l.contains('HTTP') && !l.contains('warm-up'),
+        orElse: () => lines.firstWhere((l) => l.contains('HTTP'), orElse: () => 'no response'),
+      );
+      final cookieLine = lines.firstWhere((l) => l.contains('cookie(s):'), orElse: () => '');
+      final detail = cookieLine.isEmpty ? postLine : '$postLine | $cookieLine';
+      throw MeeshoError('Login failed — $detail. Open Settings, then Login diagnostics, and send me that text.');
     }
 
     final body = _asMap(success.data);
